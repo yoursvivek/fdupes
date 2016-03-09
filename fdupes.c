@@ -53,6 +53,10 @@
 #define F_EXCLUDEHIDDEN     0x1000
 #define F_PERMISSIONS       0x2000
 #define F_REVERSE           0x4000
+#define F_SKIPBYTEVERIFY    0x10000
+#define F_XDEVICE           0x20000
+#define F_MINFILESIZE       0x40000
+#define F_MAXFILESIZE       0x80000
 
 typedef enum {
   ORDER_TIME = 0,
@@ -62,6 +66,10 @@ typedef enum {
 char *program_name;
 
 unsigned long flags = 0;
+
+unsigned long long int min_file_size = 0;
+unsigned long long int max_file_size = 0;
+dev_t workingdevice;
 
 #define CHUNK_SIZE 8192
 
@@ -238,6 +246,30 @@ int nonoptafter(char *option, int argc, char **oldargv,
   return x;
 }
 
+int skipfile(file_t *file, struct stat info)
+{
+  if(ISFLAG(flags, F_MINFILESIZE) && !S_ISDIR(info.st_mode) && file->size < min_file_size)
+  {
+    //printf("Small: %s %ld - %ld\n", file->d_name, min_file_size, filesize(file->d_name));
+    return 1;
+  }
+
+  if(ISFLAG(flags, F_MAXFILESIZE) && !S_ISDIR(info.st_mode) && file->size > max_file_size)
+  {
+    return 2;
+  }
+
+  return 0;
+}
+
+void getfilestats(file_t *file)
+{
+  file->size = filesize(file->d_name);
+  file->inode = getinode(file->d_name);
+  file->device = getdevice(file->d_name);
+  file->mtime = getmtime(file->d_name);
+}
+
 int grokdir(char *dir, file_t **filelistp)
 {
   DIR *cd;
@@ -250,7 +282,11 @@ int grokdir(char *dir, file_t **filelistp)
   static int progress = 0;
   static char indicator[] = "-\\|/";
   char *fullname, *name;
-
+  
+  if (ISFLAG(flags, F_XDEVICE) && getdevice(dir) != workingdevice) {
+  	printf("Skipping out of device item: %s\n", dir);
+	return 0;
+  }
   cd = opendir(dir);
 
   if (!cd) {
@@ -294,6 +330,8 @@ int grokdir(char *dir, file_t **filelistp)
       if (lastchar >= 0 && dir[lastchar] != '/')
 	strcat(newfile->d_name, "/");
       strcat(newfile->d_name, dirinfo->d_name);
+
+      getfilestats(newfile);
       
       if (ISFLAG(flags, F_EXCLUDEHIDDEN)) {
 	fullname = strdup(newfile->d_name);
@@ -306,7 +344,7 @@ int grokdir(char *dir, file_t **filelistp)
 	free(fullname);
       }
 
-      if (filesize(newfile->d_name) == 0 && ISFLAG(flags, F_EXCLUDEEMPTY)) {
+      if (newfile->size == 0 && ISFLAG(flags, F_EXCLUDEEMPTY)) {
 	free(newfile->d_name);
 	free(newfile);
 	continue;
@@ -322,6 +360,13 @@ int grokdir(char *dir, file_t **filelistp)
 	free(newfile->d_name);
 	free(newfile);
 	continue;
+      }
+      
+      if(skipfile(newfile, info))
+      {
+        free(newfile->d_name);
+        free(newfile);
+        continue;
       }
 
       if (S_ISDIR(info.st_mode)) {
@@ -429,17 +474,10 @@ void purgetree(filetree_t *checktree)
   free(checktree);
 }
 
-void getfilestats(file_t *file)
-{
-  file->size = filesize(file->d_name);
-  file->inode = getinode(file->d_name);
-  file->device = getdevice(file->d_name);
-  file->mtime = getmtime(file->d_name);
-}
 
 int registerfile(filetree_t **branch, file_t *file)
 {
-  getfilestats(file);
+  //getfilestats(file);
 
   *branch = (filetree_t*) malloc(sizeof(filetree_t));
   if (*branch == NULL) {
@@ -507,10 +545,12 @@ file_t **checkmatch(filetree_t **root, filetree_t *checktree, file_t *file)
      duplicates unless the user specifies otherwise.
   */    
 
-  if (!ISFLAG(flags, F_CONSIDERHARDLINKS) && is_hardlink(checktree, file))
-    return NULL;
+  if (!ISFLAG(flags, F_CONSIDERHARDLINKS) &&
+          is_hardlink(checktree, file) &&
+          (file->inode == checktree->file->inode) && 
+          (file->device == checktree->file->device)) return NULL; 
 
-  fsize = filesize(file->d_name);
+  fsize = file->size;
   
   if (fsize < checktree->file->size) 
     cmpresult = -1;
@@ -604,7 +644,7 @@ file_t **checkmatch(filetree_t **root, filetree_t *checktree, file_t *file)
     }
   } else 
   {
-    getfilestats(file);
+    //getfilestats(file);
     return &checktree->file;
   }
 }
@@ -989,6 +1029,10 @@ void help_text()
   printf(" -f --omitfirst   \tomit the first file in each set of matches\n");
   printf(" -1 --sameline    \tlist each set of matches on a single line\n");
   printf(" -S --size        \tshow size of duplicate files\n");
+  printf(" -b --minfilesize \tConsider only files larger than N KB\n");
+  printf(" -B --maxfilesize \tConsider only files smaller than N KB\n");
+  printf(" -e --skipverify  \tSkip final byte to byte verification after checksum match\n");
+  printf(" -x --xdevice     \tDo not cross into another device from the given arguments starting device\n");
   printf(" -m --summarize   \tsummarize dupe information\n");
   printf(" -q --quiet       \thide progress indicator\n");
   printf(" -d --delete      \tprompt user for files to preserve and delete all\n"); 
@@ -1013,6 +1057,39 @@ void help_text()
 #endif
 }
 
+unsigned long long int parsesizeinput(char* input){
+	unsigned long long int inputsize;
+	char * endptr = NULL;
+	inputsize = strtoull(input, &endptr,10);
+	switch(*endptr){
+		case '\0':
+			inputsize = inputsize * 1024;
+			break;
+		case 'k':
+		case 'K':
+			inputsize = inputsize * 1024;
+			endptr++;
+			break;
+		case 'm':
+		case 'M':
+			inputsize = inputsize * 1024*1024;
+			endptr++;
+			break;
+		case 'g':
+		case 'G':
+			inputsize = inputsize *1024*1024*1024;
+			endptr++;
+			break;
+		default:
+			break;
+	}
+	if (*endptr != '\0'){
+            fprintf(stderr,"fdupes: provide numeric argument >0 for file size to consider\n");
+		exit(1);
+	}
+	return inputsize;
+}
+
 int main(int argc, char **argv) {
   int x;
   int opt;
@@ -1027,7 +1104,8 @@ int main(int argc, char **argv) {
   char **oldargv;
   int firstrecurse;
   ordertype_t ordertype = ORDER_TIME;
-  
+
+
 #ifndef OMIT_GETOPT_LONG
   static struct option long_options[] = 
   {
@@ -1053,6 +1131,10 @@ int main(int argc, char **argv) {
     { "permissions", 0, 0, 'p' },
     { "order", 1, 0, 'o' },
     { "reverse", 0, 0, 'i' },
+    { "minfilesize", 1, 0, 'b' },
+    { "maxfilesize", 1, 0, 'B' },
+    { "skipverify", 0, 0, 'e' },
+    { "xdevice", 0, 0, 'x' },
     { 0, 0, 0, 0 }
   };
 #define GETOPT getopt_long
@@ -1064,7 +1146,7 @@ int main(int argc, char **argv) {
 
   oldargv = cloneargs(argc, argv);
 
-  while ((opt = GETOPT(argc, argv, "frRq1SsHlnAdvhNmpo:i"
+  while ((opt = GETOPT(argc, argv, "frRq1SsHlnAdvhNmpxeio:b:B:"
 #ifndef OMIT_GETOPT_LONG
           , long_options, NULL
 #endif
@@ -1114,6 +1196,34 @@ int main(int argc, char **argv) {
       break;
     case 'm':
       SETFLAG(flags, F_SUMMARIZEMATCHES);
+      break;
+    case 'e':
+      SETFLAG(flags, F_SKIPBYTEVERIFY);
+      break;
+    case 'x':
+      SETFLAG(flags, F_XDEVICE);
+      break;
+    case 'b':
+      SETFLAG(flags, F_MINFILESIZE);
+      if (strlen(optarg) == 0) {
+            fprintf(stderr,"fdupes -b: provide numeric argument >0 for minimum file size to consider\n");
+            exit(1);
+      }
+      min_file_size = parsesizeinput(optarg);
+      break;
+    case 'B':
+      SETFLAG(flags, F_MAXFILESIZE);
+      if (strlen(optarg) == 0) {
+            fprintf(stderr,"fdupes -B: provide numeric argument >0 for maximum file size to consider\n");
+            exit(1);
+      }
+      max_file_size = parsesizeinput(optarg);
+
+      if (ISFLAG(flags, F_MAXFILESIZE) && ISFLAG(flags, F_MINFILESIZE) && min_file_size > max_file_size){
+             fprintf(stderr, "fdupes -B: min file size (-b) must be smaller then max file size(-B)\n");
+             exit(1);
+      }
+
       break;
     case 'p':
       SETFLAG(flags, F_PERMISSIONS);
@@ -1166,17 +1276,25 @@ int main(int argc, char **argv) {
 
     /* F_RECURSE is not set for directories before --recurse: */
     for (x = optind; x < firstrecurse; x++)
-      filecount += grokdir(argv[x], &files);
-
+	{
+		workingdevice = getdevice(argv[x]);
+		filecount += grokdir(argv[x], &files);
+	}
     /* Set F_RECURSE for directories after --recurse: */
     SETFLAG(flags, F_RECURSE);
 
     for (x = firstrecurse; x < argc; x++)
-      filecount += grokdir(argv[x], &files);
+	{
+		workingdevice = getdevice(argv[x]);
+	      filecount += grokdir(argv[x], &files);
+	}
   } else {
-    for (x = optind; x < argc; x++)
-      filecount += grokdir(argv[x], &files);
+    for (x = optind; x < argc; x++){
+      		workingdevice = getdevice(argv[x]);
+		filecount += grokdir(argv[x], &files);
+	}
   }
+
 
   if (!files) {
     if (!ISFLAG(flags, F_HIDEPROGRESS)) fprintf(stderr, "\r%40s\r", " ");
@@ -1205,7 +1323,7 @@ int main(int argc, char **argv) {
 	continue;
       }
 
-      if (confirmmatch(file1, file2)) {
+      if (ISFLAG(flags, F_SKIPBYTEVERIFY) || confirmmatch(file1, file2)) {
         registerpair(match, curfile,
             (ordertype == ORDER_TIME) ? sort_pairs_by_mtime : sort_pairs_by_filename );
 	
